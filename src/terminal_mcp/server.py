@@ -205,12 +205,53 @@ def build_app():
 
 
 def main() -> None:
+    import argparse
     import uvicorn
 
-    host = os.environ.get("TERMINAL_MCP_HOST", "127.0.0.1")
-    port = int(os.environ.get("TERMINAL_MCP_PORT", "8765"))
+    parser = argparse.ArgumentParser(
+        prog="terminal-mcp",
+        description="PTY-backed terminal MCP server (Streamable HTTP + bearer-token agent isolation).",
+    )
+    parser.add_argument(
+        "-H", "--host",
+        default=os.environ.get("TERMINAL_MCP_HOST", "127.0.0.1"),
+        help="Bind address (default: 127.0.0.1; use 0.0.0.0 to expose to the network). "
+             "Falls back to env TERMINAL_MCP_HOST.",
+    )
+    parser.add_argument(
+        "-p", "--port", type=int,
+        default=int(os.environ.get("TERMINAL_MCP_PORT", "8765")),
+        help="TCP port (default: 8765). Falls back to env TERMINAL_MCP_PORT.",
+    )
+    parser.add_argument(
+        "-t", "--tokens",
+        default=os.environ.get("TERMINAL_MCP_TOKENS", ""),
+        help="Comma-separated bearer-token whitelist. Empty (default) accepts any "
+             "non-empty token — different tokens still get isolated session pools. "
+             "Falls back to env TERMINAL_MCP_TOKENS.",
+    )
+    parser.add_argument(
+        "-b", "--buffer-bytes", type=int,
+        default=int(os.environ.get("TERMINAL_MCP_BUFFER_BYTES", str(DEFAULT_BUFFER_BYTES))),
+        help=f"Per-session history ring-buffer cap in bytes (default: {DEFAULT_BUFFER_BYTES}). "
+             "Falls back to env TERMINAL_MCP_BUFFER_BYTES.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("TERMINAL_MCP_LOG_LEVEL", "info"),
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        help="uvicorn log level (default: info).",
+    )
+    args = parser.parse_args()
+
+    # Push parsed values into env so build_app() picks them up uniformly.
+    os.environ["TERMINAL_MCP_HOST"] = args.host
+    os.environ["TERMINAL_MCP_PORT"] = str(args.port)
+    os.environ["TERMINAL_MCP_TOKENS"] = args.tokens
+    os.environ["TERMINAL_MCP_BUFFER_BYTES"] = str(args.buffer_bytes)
+
     app = build_app()
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 
 if __name__ == "__main__":
