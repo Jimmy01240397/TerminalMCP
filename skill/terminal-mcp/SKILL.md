@@ -153,8 +153,8 @@ output(victim)                    # see what the service got
 |---|---|
 | `run(cmd, cwd?, env?, rows?, cols?)` | Spawn `/bin/sh -c <cmd>` in a fresh PTY. Returns `{session_id, pid}`. |
 | `input(session_id, data, binary?)` | Write to stdin. `binary=true` → `data` is base64. |
-| `output(session_id, binary?)` | Drain PTY, append to history, return drained bytes. Returns `{content, bytes, is_alive, exit_code, exit_signal}`. |
-| `output_history(session_id, offset?, length?, binary?)` | Non-destructive random-access read of history (only contains what previous `output` calls drained). Returns `{content, content_offset, bytes, total_length, buffer_start}`. Negative `offset` = from end. `length` null / -1 = until end. |
+| `output(session_id, binary?)` | Drain PTY, append to history, return drained bytes. Returns `{content, length, is_alive, exit_code, exit_signal}`. `length` is the raw byte count of `content` (pre base64). |
+| `output_history(session_id, offset?, length?, binary?)` | Non-destructive random-access read of history (only contains what previous `output` calls drained). Returns `{content, content_offset, length, total_length, buffer_start}`. Negative `offset` = from end. `length` parameter null / -1 = until end. |
 | `list_sessions()` | Inventory your sessions. |
 | `close(session_id)` | SIGKILL, reap, drain final bytes into history, and remove. Use `send_signal` first if you want graceful termination. |
 | `send_signal(session_id, sig)` | Send a signal without removing. |

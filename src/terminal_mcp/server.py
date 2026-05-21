@@ -99,7 +99,7 @@ def build_app():
         drained = await asyncio.to_thread(sess.drain_and_record)
         return {
             "content": _encode_bytes(drained, binary),
-            "bytes": len(drained),
+            "length": len(drained),
             "is_alive": sess.is_alive,
             "exit_code": sess.exit_code,
             "exit_signal": sess.exit_signal,
@@ -132,7 +132,7 @@ def build_app():
         return {
             "content": _encode_bytes(content, binary),
             "content_offset": content_offset,
-            "bytes": len(content),
+            "length": len(content),
             "total_length": total,
             "buffer_start": buf_start,
         }

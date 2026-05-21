@@ -127,8 +127,8 @@ async def main() -> int:
                 hist = await call(s, "output_history", {"session_id": sid})
                 check("hello-from-pty" in hist["content"],
                       "history contains echo output")
-                check(hist["total_length"] == hist["bytes"] or
-                      hist["total_length"] >= hist["bytes"],
+                check(hist["total_length"] == hist["length"] or
+                      hist["total_length"] >= hist["length"],
                       "history total_length is consistent")
 
                 # buffer overflow: produce > 256 bytes, ensure ring drops oldest
@@ -150,13 +150,13 @@ async def main() -> int:
                       f"total_length tracks dropped bytes (got {hist2['total_length']})")
                 check(hist2["buffer_start"] > 0,
                       f"ring dropped early bytes (buffer_start={hist2['buffer_start']})")
-                check(hist2["bytes"] <= 256,
-                      f"buffer respects capacity (got {hist2['bytes']})")
+                check(hist2["length"] <= 256,
+                      f"buffer respects capacity (got {hist2['length']})")
 
                 # paginated reads
                 slice1 = await call(s, "output_history",
                                     {"session_id": sid2, "offset": hist2["buffer_start"], "length": 50})
-                check(slice1["bytes"] == 50, "paginated read returns requested length")
+                check(slice1["length"] == 50, "paginated read returns requested length")
                 check(slice1["content_offset"] == hist2["buffer_start"],
                       "content_offset matches requested offset")
 
