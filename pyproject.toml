@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "terminal-mcp"
+version = "0.1.0"
+description = "PTY-backed terminal MCP server for CTF agents"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.6.0",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+terminal-mcp = "terminal_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/terminal_mcp"]
