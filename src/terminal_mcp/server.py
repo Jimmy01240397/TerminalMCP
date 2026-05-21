@@ -85,18 +85,21 @@ def build_app():
 
     @mcp.tool(
         description=(
-            "Take everything the session has emitted since the last `output` "
-            "call. Drains a pending queue — use `output_history` if you want "
-            "to re-read past output."
+            "Drain everything currently buffered in the session's PTY and "
+            "return it. The drained bytes are also appended to the session's "
+            "history ring buffer — `output` is the only thing that promotes "
+            "bytes into history. Call this periodically on long-running "
+            "sessions, otherwise the child eventually blocks on its own stdout "
+            "(PTY kernel buffer fills up — deliberate backpressure)."
         )
     )
     async def output(session_id: str, binary: bool = False) -> dict[str, Any]:
         agent = _agent()
         sess = agent.get(session_id)
-        pending = sess.take_pending()
+        drained = await asyncio.to_thread(sess.drain_and_record)
         return {
-            "content": _encode_bytes(pending, binary),
-            "bytes": len(pending),
+            "content": _encode_bytes(drained, binary),
+            "bytes": len(drained),
             "is_alive": sess.is_alive,
             "exit_code": sess.exit_code,
             "exit_signal": sess.exit_signal,
@@ -104,13 +107,15 @@ def build_app():
 
     @mcp.tool(
         description=(
-            "Read from the session's full output history (ring buffer). "
-            "Offsets are absolute byte offsets into the lifetime output stream. "
+            "Read from the session's history ring buffer. History only contains "
+            "bytes that have been drained by an `output` call — fresh PTY bytes "
+            "that no `output` has touched yet are not visible here. Offsets are "
+            "absolute byte offsets into the lifetime *output()-drained* stream. "
             "If `offset` precedes the buffer's oldest still-held byte, the "
             "returned content begins at the buffer's start — `content_offset` "
             "tells you where it actually begins. `length` < 0 or null means "
-            "'until the end'. `total_length` is the total bytes ever emitted, "
-            "including those that have rolled out of the buffer."
+            "'until the end'. `total_length` is the total bytes ever promoted "
+            "into history, including those that have rolled out of the buffer."
         )
     )
     async def output_history(
@@ -135,32 +140,40 @@ def build_app():
     @mcp.tool(description="List your current sessions (scoped to your bearer token).")
     async def list_sessions() -> list[dict[str, Any]]:
         agent = _agent()
-        return [
-            {
-                "session_id": s.id,
-                "cmd": s.cmd,
-                "pid": s.pid,
-                "is_alive": s.is_alive,
-                "exit_code": s.exit_code,
-                "exit_signal": s.exit_signal,
-                "history_bytes": s.history.total_written,
-            }
-            for s in agent.list()
-        ]
+
+        def _snapshot() -> list[dict[str, Any]]:
+            out = []
+            for s in agent.list():
+                s.refresh()  # update is_alive / exit_code without draining
+                out.append(
+                    {
+                        "session_id": s.id,
+                        "cmd": s.cmd,
+                        "pid": s.pid,
+                        "is_alive": s.is_alive,
+                        "exit_code": s.exit_code,
+                        "exit_signal": s.exit_signal,
+                        "history_bytes": s.history.total_written,
+                    }
+                )
+            return out
+
+        return await asyncio.to_thread(_snapshot)
 
     @mcp.tool(
         description=(
-            "Send a signal to a session and remove it from your session list. "
-            "Default signal is 9 (SIGKILL). Use 2 for SIGINT or 15 for SIGTERM "
-            "if you want to give the process a chance to clean up."
+            "Force-kill the session (SIGKILL), reap the child, drain any final "
+            "bytes into history, and remove the session from your list. Use "
+            "`send_signal` first if you want to send a catchable signal "
+            "(SIGTERM / SIGINT) and let the process clean up."
         )
     )
-    async def close(session_id: str, sig: int = 9) -> dict[str, Any]:
+    async def close(session_id: str) -> dict[str, Any]:
         agent = _agent()
         sess = agent.remove(session_id)
         if sess is None:
             return {"closed": False}
-        sess.signal(sig)
+        await asyncio.to_thread(sess.close)
         return {"closed": True, "session_id": session_id}
 
     @mcp.tool(

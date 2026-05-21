@@ -136,6 +136,14 @@ async def main() -> int:
                                  {"cmd": "for i in $(seq 1 50); do printf 'XXXXXXXXXX'; done"})
                 sid2 = res["session_id"]
                 await asyncio.sleep(0.4)
+
+                # History is empty until output() is called — verify that first.
+                hist_empty = await call(s, "output_history", {"session_id": sid2})
+                check(hist_empty["total_length"] == 0,
+                      f"history is empty before output() (got total_length={hist_empty['total_length']})")
+
+                # Drain into history, then check overflow behavior.
+                await call(s, "output", {"session_id": sid2})
                 hist2 = await call(s, "output_history", {"session_id": sid2})
                 # 50 * 10 = 500 bytes emitted; buffer is 256, so buffer_start > 0
                 check(hist2["total_length"] >= 500,

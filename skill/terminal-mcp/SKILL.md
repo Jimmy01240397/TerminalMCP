@@ -25,22 +25,26 @@ If you start with Bash and discover the program is waiting on stdin or buffering
 
 ## Mental model
 
-A session is an async PTY-backed child:
+A session is an async PTY-backed child. Output is **read on demand** — there's no background thread; bytes sit in the OS's PTY kernel buffer until `output` pulls them out.
 
 ```
-run(cmd) ─► session_id (returns immediately; cmd is running)
-            │
-            ├── input(session_id, data)        write bytes to its stdin
-            ├── output(session_id)             drain everything written since last output()
-            ├── output_history(sid, off, len)  random-access read of the full history
-            └── close(session_id)              kill + forget
+child stdout ─► PTY kernel buffer (~8 KB OS-managed)
+                       │
+                       │  (output() drains it: non-blocking read until empty)
+                       ▼
+                 history ring buffer  (cap = TERMINAL_MCP_BUFFER_BYTES, default 1 MiB)
+                       │
+                       ├─► returned to caller       (= output() return value)
+                       └─► random-access by offset  (= output_history())
 ```
 
-`run` is fire-and-forget. The shell is `/bin/sh -c <cmd>`. The session keeps existing after the process exits — `output` still works to drain leftover bytes, and `is_alive` / `exit_code` in the response tell you what happened. `close` only matters when you want to actively kill or free a session.
+`run` is fire-and-forget — it `pty.fork()`s, execs `/bin/sh -c <cmd>`, and returns the `session_id` immediately. The session keeps existing after the process exits — `output` still drains any final bytes, and `is_alive` / `exit_code` in every response tell you what happened. `close` SIGKILLs the child (if alive), drains the last bytes into history, and removes the session.
 
-`output` is **destructive read**: it returns everything emitted since the last `output` call and clears the pending buffer. Call it once per "checkpoint."
+`output` is **destructive read + history gateway**: it drains everything currently sitting in the PTY, appends it to the history ring buffer, and returns it. Two output calls in a row → the second is empty. **The history only contains bytes that some `output` call has already drained** — fresh PTY bytes that no `output` has touched yet are not yet in history.
 
-`output_history` is a **separate, independent ring buffer** that the PTY reader thread fills directly — so it grows whether or not you ever call `output`. It uses absolute byte offsets anchored to the lifetime of the stream (not to the buffer's current contents): when the ring overflows, `total_length` keeps climbing and `buffer_start` advances past the dropped bytes. **You can use `output_history` without ever calling `output`** — this is the right pattern for "fire off a long-running job, sample its state every now and then" (fuzzers, long traces, background listeners). `output` and `output_history` are decoupled: draining one does not affect the other.
+`output_history` is **non-destructive random access** into that history ring. It uses absolute byte offsets anchored to the lifetime of the *drained* stream (not to the buffer's current contents). When the ring overflows, `total_length` keeps climbing and `buffer_start` advances past the dropped bytes. Read it as many times as you like with no side effect.
+
+**Important consequence — there is no background reader.** If you spawn a chatty child and never call `output`, the PTY kernel buffer (~8 KB) fills up and the child's next `write(stdout)` **blocks**. That's deliberate backpressure: no memory leak, no OOM risk, just a frozen child until you `output` and unblock it. So on long-running jobs, call `output` periodically even if you don't care about the return value — that single act both records to history and keeps the child making progress.
 
 ## The standard loop
 
@@ -105,18 +109,17 @@ sid = run("nc ctf.host 1337")
 
 ### Long-running background job
 
-Spawn it and check in periodically:
+Spawn it and call `output` periodically — even if you don't care about the return value, you have to. It both keeps the child unblocked (PTY buffer drained) and pushes the bytes into history so `output_history` can find them later:
 
 ```
 sid = run("./fuzzer --target ./bin --time 600")
-# do other work in other sessions…
-# later:
-out = output(sid)                 # drain new findings since last check
-# or get the whole picture:
+# work on other things, but come back every few turns:
+_ = output(sid)                   # drains PTY → history (ignore return if you want)
+# …later, look at the whole picture:
 hist = output_history(sid)        # total_length, buffer_start, content
 ```
 
-For very chatty processes, the ring buffer will drop the oldest bytes — `output_history` still tells you `total_length` (how much was ever written) and `buffer_start` (offset of the oldest still-buffered byte). Use `offset` + `length` to page through what's still there.
+If the child outpaces the ring buffer (default 1 MiB) between your output calls, the oldest bytes silently drop — `output_history` tells you `total_length` (how much was ever drained) and `buffer_start` (offset of the oldest still-buffered byte). Bump `TERMINAL_MCP_BUFFER_BYTES` at server start, or call `output` more often.
 
 ### Two processes that talk to each other
 
@@ -134,9 +137,11 @@ output(victim)                    # see what the service got
 
 - **`\r\n` line endings everywhere.** PTYs convert `\n` to `\r\n` on output. When pattern-matching, either strip `\r` or include it in the pattern.
 - **Your input echoes.** A typical PTY echoes stdin to stdout. So `input(sid, "ls\n")` followed by `output(sid)` returns something like `ls\r\nfile1 file2\r\n$ `. The first line is your own echo. To suppress echo, send `stty -echo\n` after `run`.
-- **`output` clears pending; `output_history` does not.** Calling `output` twice in a row gives empty content the second time. `output_history` is non-destructive and unaffected by `output` — read from it as many times as you like.
-- **History silently evicts old bytes.** The history ring is bounded (default 1 MiB, set at server start via `TERMINAL_MCP_BUFFER_BYTES`). Once a chatty process emits more than that, the oldest bytes are dropped — `total_length` still reports the lifetime count, but `output_history(offset=0)` only returns from `buffer_start` onward. Check `buffer_start > 0` to detect that data has been lost. To prevent loss in noisy long-running jobs: either ask for the server to start with a bigger buffer, or poll `output` regularly and stash the result on your side, or page through `output_history` faster than bytes roll off. Don't assume `offset=0` means "from the beginning of the run" — it means "from whatever's still buffered."
-- **Sessions outlive their process.** After the child exits, `is_alive=false` and `exit_code` is set, but the session and its history are still there. Call `close` when you're really done — otherwise sessions and ring buffers accumulate.
+- **`output` drains the PTY *and* writes to history.** Calling it twice in a row → the second is empty (PTY was already drained). `output_history` is the non-destructive read of what `output` has already drained — call it as many times as you like.
+- **`output_history` only sees what some `output` call has already drained.** Fresh bytes sitting in the PTY kernel buffer haven't been promoted yet. If `output_history` looks empty for a freshly-spawned session, call `output` first.
+- **If you never call `output`, the child blocks on its stdout.** The PTY kernel buffer is small (~8 KB). Once it fills, `write(stdout)` in the child blocks — the process *freezes* until you `output` and drain it. This is backpressure, not a bug. On long jobs, call `output` periodically even if you ignore the return value.
+- **History silently evicts old bytes.** The ring is bounded (default 1 MiB, set at server start via `TERMINAL_MCP_BUFFER_BYTES`). If `output` drains more than the cap before you next call `output_history`, the oldest bytes are dropped — `total_length` still reports the lifetime drained count, but `output_history(offset=0)` only returns from `buffer_start` onward. Check `buffer_start > 0` to detect loss. Don't assume `offset=0` means "from the beginning of the run" — it means "from whatever's still buffered."
+- **Sessions outlive their process.** After the child exits, `is_alive=false` and `exit_code` is set, but the session and its history are still there. Call `close` when you're really done — otherwise dead sessions and ring buffers accumulate.
 - **`run` returns before the child has produced any output.** If you `run("echo hi")` and immediately `output`, you may get an empty string. Either call `output` 2–3 times with brief gaps, or check `is_alive` — once it's false you've definitely got everything.
 - **Bearer-token isolation.** `list_sessions` only shows your own sessions — you can't see or steal another agent's. If you expect a session to be there and it isn't, you may be talking to the server with a different token than you think.
 - **Window size matters for some tools.** Programs like `less`, `vim`, gdb's TUI render based on `$LINES` / `$COLUMNS`. The default is 24×80. If output gets paginated or wraps oddly, `resize(sid, rows, cols)` to something bigger (e.g. 50×200).
@@ -148,9 +153,9 @@ output(victim)                    # see what the service got
 |---|---|
 | `run(cmd, cwd?, env?, rows?, cols?)` | Spawn `/bin/sh -c <cmd>` in a fresh PTY. Returns `{session_id, pid}`. |
 | `input(session_id, data, binary?)` | Write to stdin. `binary=true` → `data` is base64. |
-| `output(session_id, binary?)` | Drain pending output. Returns `{content, bytes, is_alive, exit_code, exit_signal}`. |
-| `output_history(session_id, offset?, length?, binary?)` | Random-access read. Returns `{content, content_offset, bytes, total_length, buffer_start}`. Negative `offset` = from end. `length` null / -1 = until end. |
+| `output(session_id, binary?)` | Drain PTY, append to history, return drained bytes. Returns `{content, bytes, is_alive, exit_code, exit_signal}`. |
+| `output_history(session_id, offset?, length?, binary?)` | Non-destructive random-access read of history (only contains what previous `output` calls drained). Returns `{content, content_offset, bytes, total_length, buffer_start}`. Negative `offset` = from end. `length` null / -1 = until end. |
 | `list_sessions()` | Inventory your sessions. |
-| `close(session_id, sig?)` | Send signal (default SIGKILL) and remove. |
+| `close(session_id)` | SIGKILL, reap, drain final bytes into history, and remove. Use `send_signal` first if you want graceful termination. |
 | `send_signal(session_id, sig)` | Send a signal without removing. |
 | `resize(session_id, rows, cols)` | Change PTY window size. |
