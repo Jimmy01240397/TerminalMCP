@@ -38,7 +38,9 @@ run(cmd) ─► session_id (returns immediately; cmd is running)
 
 `run` is fire-and-forget. The shell is `/bin/sh -c <cmd>`. The session keeps existing after the process exits — `output` still works to drain leftover bytes, and `is_alive` / `exit_code` in the response tell you what happened. `close` only matters when you want to actively kill or free a session.
 
-`output` is **destructive read**: it returns everything emitted since the last `output` call and clears the pending buffer. Call it once per "checkpoint." If you want to re-read, use `output_history` — it's a per-session ring buffer with absolute byte offsets (anchored to the lifetime of the stream, not the buffer's current contents). When the buffer overflows, `total_length` keeps growing but `buffer_start` advances past the dropped bytes.
+`output` is **destructive read**: it returns everything emitted since the last `output` call and clears the pending buffer. Call it once per "checkpoint."
+
+`output_history` is a **separate, independent ring buffer** that the PTY reader thread fills directly — so it grows whether or not you ever call `output`. It uses absolute byte offsets anchored to the lifetime of the stream (not to the buffer's current contents): when the ring overflows, `total_length` keeps climbing and `buffer_start` advances past the dropped bytes. **You can use `output_history` without ever calling `output`** — this is the right pattern for "fire off a long-running job, sample its state every now and then" (fuzzers, long traces, background listeners). `output` and `output_history` are decoupled: draining one does not affect the other.
 
 ## The standard loop
 
@@ -132,7 +134,7 @@ output(victim)                    # see what the service got
 
 - **`\r\n` line endings everywhere.** PTYs convert `\n` to `\r\n` on output. When pattern-matching, either strip `\r` or include it in the pattern.
 - **Your input echoes.** A typical PTY echoes stdin to stdout. So `input(sid, "ls\n")` followed by `output(sid)` returns something like `ls\r\nfile1 file2\r\n$ `. The first line is your own echo. To suppress echo, send `stty -echo\n` after `run`.
-- **`output` clears pending.** Calling it twice in a row gives empty content the second time. Use `output_history` if you want to re-read.
+- **`output` clears pending; `output_history` does not.** Calling `output` twice in a row gives empty content the second time. `output_history` is non-destructive and unaffected by `output` — read from it as many times as you like.
 - **Sessions outlive their process.** After the child exits, `is_alive=false` and `exit_code` is set, but the session and its history are still there. Call `close` when you're really done — otherwise sessions and ring buffers accumulate.
 - **`run` returns before the child has produced any output.** If you `run("echo hi")` and immediately `output`, you may get an empty string. Either call `output` 2–3 times with brief gaps, or check `is_alive` — once it's false you've definitely got everything.
 - **Bearer-token isolation.** `list_sessions` only shows your own sessions — you can't see or steal another agent's. If you expect a session to be there and it isn't, you may be talking to the server with a different token than you think.
