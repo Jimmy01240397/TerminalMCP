@@ -89,14 +89,16 @@ async def main() -> int:
         return {}
 
     try:
-        # --- bad auth ---------------------------------------------------------
+        # --- no-bearer mode (no whitelist) → anonymous agent accepted --------
         try:
             async with streamablehttp_client(url) as (r, w, _):
                 async with ClientSession(r, w) as s:
                     await s.initialize()
-            check(False, "request without bearer token is rejected")
-        except Exception:
-            check(True, "request without bearer token is rejected")
+                    tools = await s.list_tools()
+                    check(len(tools.tools) > 0,
+                          "no-bearer request is accepted as anonymous agent")
+        except Exception as exc:
+            check(False, f"no-bearer should be accepted in no-whitelist mode (got {exc!r})")
 
         # --- agent A ----------------------------------------------------------
         headers_a = {"Authorization": f"Bearer {token_a}"}
